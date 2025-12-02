@@ -2,9 +2,7 @@ import io
 import os
 import re
 import datetime
-import mimetypes
 import requests
-from pathlib import Path
 from urllib.parse import quote_plus
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -12,8 +10,9 @@ from googleapiclient.http import MediaIoBaseDownload
 
 # === CONFIGURACIÓN GENERAL ===
 CREDENTIALS_FILE = 'credentials.json'
+# Se sube al endpoint con el nombre prefijado MM_ (ej. 09_nombre.xlsx)
 ENDPOINT_UPLOAD = "https://endpoints.caabsa.com/SucursalesSINUBE_API/uploadSINUBE_183VistaNorte"
-SUCURSAL_HEADER = "183 VISTA NORTE"
+SUCURSAL_HEADER = "183 VISTA NORTE"  # ← actualizado
 
 # === MAPA DE MESES EN ESPAÑOL MAYÚSCULAS ===
 MESES_ES = {
@@ -21,27 +20,15 @@ MESES_ES = {
     5: "MAYO", 6: "JUNIO", 7: "JULIO", 8: "AGOSTO",
     9: "SEPTIEMBRE", 10: "OCTUBRE", 11: "NOVIEMBRE", 12: "DICIEMBRE"
 }
-# Inverso: "AGOSTO" -> 8
 MESES_INV = {v.upper(): k for k, v in MESES_ES.items()}
 
-# === EXPORTS SOPORTADOS PARA MIMETYPES DE GOOGLE ===
-GOOGLE_EXPORTS = {
-    'application/vnd.google-apps.spreadsheet': (
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.xlsx'
-    ),
-    'application/vnd.google-apps.document': (
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document', '.docx'
-    ),
-    'application/vnd.google-apps.presentation': (
-        'application/vnd.openxmlformats-officedocument.presentationml.presentation', '.pptx'
-    ),
-    'application/vnd.google-apps.drawing': (
-        'image/png', '.png'
-    ),
-    'application/vnd.google-apps.jam': (
-        'application/pdf', '.pdf'
-    ),
-}
+# ============================
+# CONFIGURACIÓN DE MODO DE EJECUCIÓN
+# ============================
+MODO_MANUAL = False          # ← True para modo manual, False para modo automático
+MES_MANUAL = "NOVIEMBRE"     # ← Mes específico cuando MODO_MANUAL=True
+ANIO_MANUAL = 2024           # ← Año específico cuando MODO_MANUAL=True
+MESES_ATRAS = 3              # ← Cantidad de meses atrás en modo automático
 
 # === AUTENTICACIÓN CON GOOGLE DRIVE ===
 def conectar_drive():
@@ -65,55 +52,47 @@ def buscar_carpeta_id(service, nombre, parent_id=None):
         print(f"❌ Carpeta '{nombre}' no encontrada.")
         return None
 
-# === OBTENER NOMBRE POR ID (archivo/carpeta) ===
+# === OBTENER NOMBRE (archivo/carpeta) POR ID ===
 def obtener_nombre_por_id(service, file_id):
     meta = service.files().get(fileId=file_id, fields="id, name").execute()
     return meta.get("name")
 
-# === LISTAR TODOS LOS ARCHIVOS (EXCEPTO FOLDERS Y _procesado) CON PAGINACIÓN ===
-def listar_archivos(service, folder_id):
+# === LISTAR XLSX/XLS/CSV/GOOGLE SHEETS QUE NO ESTÉN PROCESADOS ===
+def listar_archivos_boletaje(service, folder_id):
     q = (
         f"'{folder_id}' in parents and trashed = false "
-        f"and mimeType != 'application/vnd.google-apps.folder' "
+        f"and (mimeType='application/vnd.google-apps.spreadsheet' "
+        f"or name contains '.xlsx' or name contains '.xls' or name contains '.csv') "
         f"and not name contains '_procesado'"
     )
-    page_token = None
-    archivos = []
-    while True:
-        resp = service.files().list(
-            q=q,
-            fields="nextPageToken, files(id, name, mimeType, parents)",
-            pageToken=page_token
-        ).execute()
-        archivos.extend(resp.get('files', []))
-        page_token = resp.get('nextPageToken')
-        if not page_token:
-            break
+    resultados = service.files().list(
+        q=q,
+        fields="files(id, name, parents, mimeType)"
+    ).execute()
+    archivos = resultados.get('files', [])
     return sorted(archivos, key=lambda x: x['name'].lower())
 
-# === DESCARGAR O EXPORTAR ARCHIVO ===
-def descargar_archivo(service, file_id, file_name, mime_type):
-    # Limpia nombre
-    safe_name = re.sub(r'[\\/:*?"<>|]+', '_', file_name).strip()
+# === DESCARGAR / EXPORTAR ARCHIVO ===
+def descargar_archivo(service, file_id, nombre_drive, mime_type):
+    # Limpia nombre para el filesystem
+    safe_name = re.sub(r'[\\/:*?\"<>|]+', '_', nombre_drive).strip()
 
-    # Archivos de Google: exportar
-    if mime_type.startswith('application/vnd.google-apps.'):
-        if mime_type in GOOGLE_EXPORTS:
-            export_mime, ext = GOOGLE_EXPORTS[mime_type]
-            base, _old_ext = os.path.splitext(safe_name)
-            nombre_destino = base + ext
-            print(f"📝 Archivo de Google detectado. Exportando como {ext}…")
-            request = service.files().export(fileId=file_id, mimeType=export_mime)
-            data = request.execute()
-            with open(nombre_destino, 'wb') as f:
-                f.write(data)
-            print(f"✅ Archivo exportado: {nombre_destino}")
-            return nombre_destino, export_mime
-        else:
-            print(f"⚠️ Tipo de Google no soportado para exportar: {mime_type}. Omitiendo.")
-            return None, None
-    # Archivos “normales”: descargar
-    nombre_destino = safe_name
+    # Si es Google Sheets -> exportar a XLSX
+    if mime_type == 'application/vnd.google-apps.spreadsheet':
+        base, _ext = os.path.splitext(safe_name)
+        nombre_destino = base + ".xlsx"
+        print("📝 Hoja de cálculo de Google detectada. Exportando a .xlsx…")
+        data = service.files().export(
+            fileId=file_id,
+            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ).execute()
+        with open(nombre_destino, 'wb') as f:
+            f.write(data)
+        print(f"✅ Archivo exportado: {nombre_destino}")
+        content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        return nombre_destino, content_type
+
+    # Si es archivo normal (xlsx/xls/csv/otro descargable)
     request = service.files().get_media(fileId=file_id)
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
@@ -122,36 +101,50 @@ def descargar_archivo(service, file_id, file_name, mime_type):
         status, done = downloader.next_chunk()
         if status:
             print(f"⬇️ Descargando... {int(status.progress() * 100)}%")
-    with open(nombre_destino, 'wb') as f:
+    with open(safe_name, 'wb') as f:
         f.write(fh.getvalue())
-    print(f"✅ Archivo guardado localmente: {nombre_destino}")
-    guessed, _ = mimetypes.guess_type(nombre_destino)
-    content_type = guessed or 'application/octet-stream'
-    return nombre_destino, content_type
+    print(f"✅ Archivo guardado localmente: {safe_name}")
+
+    # Content-type según extensión
+    ext = os.path.splitext(safe_name)[1].lower()
+    if ext == ".csv":
+        content_type = "text/csv"
+    elif ext == ".xlsx":
+        content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    elif ext == ".xls":
+        content_type = "application/vnd.ms-excel"
+    else:
+        content_type = "application/octet-stream"
+    return safe_name, content_type
 
 # === SUBIR ARCHIVO AL ENDPOINT CON PARÁMETRO DE SUCURSAL ===
-def subir_archivo(endpoint_base, archivo_path, sucursal_nombre, content_type=None):
+def subir_archivo(endpoint_base, archivo_path, sucursal_nombre, content_type_hint=None):
     try:
         endpoint = f"{endpoint_base}?sucursal={quote_plus(sucursal_nombre)}"
-        if content_type is None:
-            guessed, _ = mimetypes.guess_type(archivo_path)
-            content_type = guessed or 'application/octet-stream'
+        if content_type_hint is None:
+            ext = os.path.splitext(archivo_path)[1].lower()
+            if ext == ".csv":
+                content_type_hint = "text/csv"
+            elif ext == ".xlsx":
+                content_type_hint = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            elif ext == ".xls":
+                content_type_hint = "application/vnd.ms-excel"
+            else:
+                content_type_hint = "application/octet-stream"
+
         with open(archivo_path, 'rb') as f:
-            files = {'file': (os.path.basename(archivo_path), f, content_type)}
+            files = {'file': (os.path.basename(archivo_path), f, content_type_hint)}
             response = requests.post(endpoint, files=files, verify=False, timeout=1200)
         print(f"📤 Código de respuesta: {response.status_code}")
-        preview = response.text if len(response.text) < 800 else response.text[:800] + '…'
-        print(f"📄 Respuesta del servidor: {preview}")
+        print(f"📄 Respuesta del servidor: {response.text[:800]}{'…' if len(response.text)>800 else ''}")
         return response.status_code == 200
     except Exception as e:
         print(f"❌ Error al subir archivo: {e}")
         return False
 
-# === RENOMBRAR ARCHIVO EN DRIVE (agrega _procesado antes de la extensión) ===
-def renombrar_archivo(service, file_id, current_name):
+# === (NO USADO) RENOMBRAR ARCHIVO EN DRIVE ===
+def renombrar_archivo(service, file_id, nuevo_nombre):
     try:
-        base, ext = os.path.splitext(current_name)
-        nuevo_nombre = f"{base}_procesado{ext}"
         service.files().update(fileId=file_id, body={"name": nuevo_nombre}).execute()
         print(f"📁 Archivo renombrado como: {nuevo_nombre}")
     except Exception as e:
@@ -166,96 +159,202 @@ def mover_a_respaldo(service, file_id, from_id, to_id):
             removeParents=from_id,
             fields='id'
         ).execute()
-        print("📦 Archivo movido a carpeta RESPALDO")
+        print("📁 Archivo movido a carpeta RESPALDO")
     except Exception as e:
         print(f"❌ Error al mover archivo a RESPALDO: {e}")
 
-# === FLUJO PRINCIPAL ===
-def main():
-    hoy = datetime.datetime.now()
-    anio = str(hoy.year)
-    service = conectar_drive()
+# === GENERAR LISTA DE MESES A PROCESAR ===
+def obtener_meses_a_procesar(mes_actual, cantidad_meses_atras=3):
+    """
+    Genera lista de meses a procesar desde mes_actual hacia atrás.
+    Retorna lista de tuplas: [(año, mes_numero, mes_nombre), ...]
+    """
+    meses_procesar = []
+    fecha_cursor = mes_actual
 
-    # Navegación por carpetas
-    raiz_id = buscar_carpeta_id(service, "Archivos de Carga Estacionamientos - ENTRA")
-    plaza_id = buscar_carpeta_id(service, "98. 183-PLAZA VISTA NORTE", raiz_id)
-    anio_id = buscar_carpeta_id(service, anio, plaza_id)
+    for i in range(cantidad_meses_atras):
+        # Retroceder un mes
+        if fecha_cursor.month == 1:
+            fecha_cursor = fecha_cursor.replace(year=fecha_cursor.year - 1, month=12)
+        else:
+            fecha_cursor = fecha_cursor.replace(month=fecha_cursor.month - 1)
 
-    # ============================
-    # Selección del MES (automático vs manual)
-    # ============================
-    USAR_MES_MANUAL = False      # ← pon True para pruebas
-    MES_MANUAL = "AGOSTO"        # ← cuando USAR_MES_MANUAL=True, usa este folder
+        anio = fecha_cursor.year
+        mes_num = fecha_cursor.month
+        mes_nombre = MESES_ES[mes_num]
+        meses_procesar.append((anio, mes_num, mes_nombre))
 
-    if USAR_MES_MANUAL:
-        mes_nombre = MES_MANUAL.strip().upper()
-        mes_id = buscar_carpeta_id(service, mes_nombre, anio_id)
-    else:
-        mes_nombre_sistema = MESES_ES[hoy.month]  # automático por mes actual
-        mes_id = buscar_carpeta_id(service, mes_nombre_sistema, anio_id)
+    return meses_procesar
 
-    if not mes_id:
-        print("🚫 No se encontró la carpeta del mes.")
-        return
+# === PROCESAR ARCHIVOS DE UN MES ESPECÍFICO ===
+def procesar_mes(service, plaza_id, anio, mes_num, mes_nombre):
+    """
+    Procesa todos los archivos de un mes específico.
+    Retorna cantidad de archivos procesados exitosamente.
+    """
+    print(f"\n{'='*80}")
+    print(f"🗓️  PROCESANDO: {mes_nombre} {anio}")
+    print(f"{'='*80}\n")
 
-    # Prefijo MM_ a partir del NOMBRE REAL de la carpeta del mes
-    nombre_mes_real = obtener_nombre_por_id(service, mes_id) or ""
-    clave_mes = nombre_mes_real.strip().upper()
-    if clave_mes not in MESES_INV:
-        print(f"⚠️ No pude mapear el mes desde el folder '{nombre_mes_real}'. "
-              f"Usaré el mes del sistema como fallback.")
-        mes_num = hoy.month
-    else:
-        mes_num = MESES_INV[clave_mes]
+    anio_str = str(anio)
     mes_dos = f"{mes_num:02d}"
-    print(f"🧩 Mes detectado por carpeta: '{nombre_mes_real}' → prefijo '{mes_dos}_'")
 
+    # Buscar carpeta del año
+    anio_id = buscar_carpeta_id(service, anio_str, plaza_id)
+    if not anio_id:
+        print(f"⚠️ No se encontró carpeta del año {anio_str}")
+        return 0
+
+    # Buscar carpeta del mes
+    mes_id = buscar_carpeta_id(service, mes_nombre, anio_id)
+    if not mes_id:
+        print(f"⚠️ No se encontró carpeta del mes {mes_nombre}")
+        return 0
+
+    # Buscar carpetas TH y RESPALDO
     th_id = buscar_carpeta_id(service, "TH", mes_id)
     respaldo_id = buscar_carpeta_id(service, "RESPALDO", mes_id)
 
     if not th_id or not respaldo_id:
         print("🚫 No se encontró carpeta TH o RESPALDO.")
-        return
+        return 0
 
-    archivos = listar_archivos(service, th_id)
+    # Listar archivos pendientes
+    archivos = listar_archivos_boletaje(service, th_id)
     if not archivos:
-        print("ℹ️ No hay archivos para procesar (o todos ya tienen _procesado).")
-        return
+        print(f"✅ No hay archivos pendientes en {mes_nombre} {anio}")
+        return 0
 
-    for archivo in archivos:
-        nombre = archivo['name']
-        file_id = archivo['id']
+    print(f"📋 Se encontraron {len(archivos)} archivo(s) para procesar\n")
+    archivos_procesados = 0
+
+    # Procesar cada archivo
+    for idx, archivo in enumerate(archivos, 1):
+        nombre_original = archivo['name']
         mime_type = archivo.get('mimeType', '')
-        print(f"\n🔄 Procesando: {nombre}  ({mime_type})")
+        print(f"[{idx}/{len(archivos)}] 🔄 Procesando: {nombre_original} ({mime_type})")
 
-        # 1) Descargar/Exportar
-        local_path, content_type = descargar_archivo(service, file_id, nombre, mime_type)
-        if not local_path:
-            print("⏭️ Omitido por tipo no soportado o error al exportar.")
+        # 1) Descargar / Exportar
+        ruta_local, content_type = descargar_archivo(service, archivo['id'], nombre_original, mime_type)
+        if not ruta_local:
+            print("⏭️ Omitido por tipo no soportado o error.")
             continue
 
-        # 2) Prefijar con MM_ el archivo local (sin tocar el de Drive)
-        prefixed_path = f"{mes_dos}_{os.path.basename(local_path)}"
-        if prefixed_path != local_path:
+        # 2) Prefijar con MM_ el archivo local (sin tocar Drive)
+        nombre_prefijado = f"{mes_dos}_{os.path.basename(ruta_local)}"
+        if nombre_prefijado != ruta_local:
             try:
-                os.rename(local_path, prefixed_path)
-                local_path = prefixed_path
-                print(f"🏷️ Renombrado local: {local_path}")
+                os.rename(ruta_local, nombre_prefijado)
+                ruta_local = nombre_prefijado
+                print(f"🏷️ Renombrado local: {ruta_local}")
             except Exception as e:
-                print(f"⚠️ No se pudo renombrar a prefijo MM_: {e}")
+                print(f"⚠️ No se pudo renombrar con prefijo MM_: {e}")
 
-        # 3) Subir
-        ok = subir_archivo(ENDPOINT_UPLOAD, local_path, SUCURSAL_HEADER, content_type)
+        # 3) Subir (con nombre prefijado)
+        ok = subir_archivo(ENDPOINT_UPLOAD, ruta_local, SUCURSAL_HEADER, content_type_hint=content_type)
 
-        # 4) Si subió bien: renombrar en Drive (agregar _procesado) y mover
+        # 4) Si subió OK, mover a RESPALDO **sin renombrar en Drive**
         if ok:
-            renombrar_archivo(service, file_id, nombre)
-            mover_a_respaldo(service, file_id, th_id, respaldo_id)
+            mover_a_respaldo(service, archivo['id'], th_id, respaldo_id)
+            archivos_procesados += 1
             try:
-                os.remove(local_path)
+                os.remove(ruta_local)
                 print("🗑️ Archivo local eliminado")
             except Exception as e:
-                print(f"⚠️ No se pudo eliminar localmente: {e}")
+                print(f"⚠️ No se pudo eliminar el archivo local: {e}")
+        else:
+            print("⚠️ No se movió a RESPALDO porque la subida falló.")
+        print("")
+
+    return archivos_procesados
+
+# === FLUJO PRINCIPAL ===
+def main():
+    hoy = datetime.datetime.now()
+    service = conectar_drive()
+
+    print(f"\n🚀 INICIANDO PROCESO DE CARGA MASIVA")
+    print(f"📅 Fecha actual: {hoy.strftime('%d/%m/%Y')}")
+
+    # Mostrar modo de ejecución
+    if MODO_MANUAL:
+        print(f"⚙️  MODO: MANUAL")
+        print(f"🎯 Procesando únicamente: {MES_MANUAL} {ANIO_MANUAL}\n")
+    else:
+        print(f"⚙️  MODO: AUTOMÁTICO")
+        print(f"🎯 Procesando últimos {MESES_ATRAS} meses + mes actual\n")
+
+    # Navegación por carpetas (ACTUALIZADO)
+    raiz_id = buscar_carpeta_id(service, "Archivos de carga Estacionamientos - ENTRA")
+    if not raiz_id:
+        print("🚫 No se encontró la carpeta raíz.")
+        return
+
+    plaza_id = buscar_carpeta_id(service, "98. 183-PLAZA VISTA NORTE", raiz_id)  # ← actualizado
+    if not plaza_id:
+        print("🚫 No se encontró la carpeta de la plaza.")
+        return
+
+    # ============================
+    # MODO MANUAL: Procesar solo un mes específico
+    # ============================
+    if MODO_MANUAL:
+        mes_nombre = MES_MANUAL.strip().upper()
+
+        # Validar que el mes existe en el diccionario
+        if mes_nombre not in MESES_INV:
+            print(f"❌ ERROR: '{MES_MANUAL}' no es un mes válido.")
+            print(f"Meses válidos: {', '.join(MESES_ES.values())}")
+            return
+
+        mes_num = MESES_INV[mes_nombre]
+        archivos_procesados = procesar_mes(service, plaza_id, ANIO_MANUAL, mes_num, mes_nombre)
+
+        # Resumen
+        print(f"\n{'='*80}")
+        print(f"📊 RESUMEN FINAL - MODO MANUAL")
+        print(f"{'='*80}")
+        print(f"✅ Total de archivos procesados: {archivos_procesados}")
+        print(f"{'='*80}\n")
+        return
+
+    # ============================
+    # MODO AUTOMÁTICO: Procesar múltiples meses
+    # ============================
+
+    print(f"📊 Se procesarán los últimos {MESES_ATRAS} meses antes del mes actual\n")
+
+    # Obtener lista de meses a procesar
+    meses_a_procesar = obtener_meses_a_procesar(hoy, MESES_ATRAS)
+
+    # Estadísticas globales
+    total_archivos_procesados = 0
+    meses_procesados = 0
+
+    # Procesar cada mes (de más antiguo a más reciente)
+    for anio, mes_num, mes_nombre in reversed(meses_a_procesar):
+        archivos_procesados = procesar_mes(service, plaza_id, anio, mes_num, mes_nombre)
+        if archivos_procesados > 0:
+            meses_procesados += 1
+            total_archivos_procesados += archivos_procesados
+
+    # Procesar mes actual
+    print(f"\n{'='*80}")
+    print(f"🗓️  PROCESANDO MES ACTUAL: {MESES_ES[hoy.month]} {hoy.year}")
+    print(f"{'='*80}\n")
+
+    archivos_mes_actual = procesar_mes(service, plaza_id, hoy.year, hoy.month, MESES_ES[hoy.month])
+    if archivos_mes_actual > 0:
+        meses_procesados += 1
+        total_archivos_procesados += archivos_mes_actual
+
+    # Resumen final
+    print(f"\n{'='*80}")
+    print(f"📊 RESUMEN FINAL - MODO AUTOMÁTICO")
+    print(f"{'='*80}")
+    print(f"✅ Meses procesados: {meses_procesados}")
+    print(f"✅ Total de archivos procesados: {total_archivos_procesados}")
+    print(f"{'='*80}\n")
 
 if __name__ == '__main__':
     main()
