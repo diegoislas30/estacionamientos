@@ -22,6 +22,14 @@ MESES_ES = {
 }
 MESES_INV = {v.upper(): k for k, v in MESES_ES.items()}
 
+# ============================
+# CONFIGURACIÓN DE MODO DE EJECUCIÓN
+# ============================
+MODO_MANUAL = False          # ← True para modo manual, False para modo automático
+MES_MANUAL = "NOVIEMBRE"     # ← Mes específico cuando MODO_MANUAL=True
+ANIO_MANUAL = 2024           # ← Año específico cuando MODO_MANUAL=True
+MESES_ATRAS = 3              # ← Cantidad de meses atrás en modo automático
+
 # === AUTENTICACIÓN CON GOOGLE DRIVE ===
 def conectar_drive():
     creds = service_account.Credentials.from_service_account_file(
@@ -155,61 +163,76 @@ def mover_a_respaldo(service, file_id, from_id, to_id):
     except Exception as e:
         print(f"❌ Error al mover archivo a RESPALDO: {e}")
 
-# === FLUJO PRINCIPAL ===
-def main():
-    hoy = datetime.datetime.now()
-    anio = str(hoy.year)
-    service = conectar_drive()
+# === GENERAR LISTA DE MESES A PROCESAR ===
+def obtener_meses_a_procesar(mes_actual, cantidad_meses_atras=3):
+    """
+    Genera lista de meses a procesar desde mes_actual hacia atrás.
+    Retorna lista de tuplas: [(año, mes_numero, mes_nombre), ...]
+    """
+    meses_procesar = []
+    fecha_cursor = mes_actual
 
-    # Navegación por carpetas (ACTUALIZADO)
-    raiz_id = buscar_carpeta_id(service, "Archivos de carga Estacionamientos - ENTRA")
-    plaza_id = buscar_carpeta_id(service, "61. 006-PLAZA REFORMA", raiz_id)  # ← actualizado
-    anio_id = buscar_carpeta_id(service, anio, plaza_id)
+    for i in range(cantidad_meses_atras):
+        # Retroceder un mes
+        if fecha_cursor.month == 1:
+            fecha_cursor = fecha_cursor.replace(year=fecha_cursor.year - 1, month=12)
+        else:
+            fecha_cursor = fecha_cursor.replace(month=fecha_cursor.month - 1)
 
-    # ============================
-    # Selección del MES (automático vs manual)
-    # ============================
-    USAR_MES_MANUAL = False       # ← pon True para pruebas
-    MES_MANUAL = "SEPTIEMBRE"    # ← cuando USAR_MES_MANUAL=True, usa este folder
+        anio = fecha_cursor.year
+        mes_num = fecha_cursor.month
+        mes_nombre = MESES_ES[mes_num]
+        meses_procesar.append((anio, mes_num, mes_nombre))
 
-    if USAR_MES_MANUAL:
-        mes_nombre = MES_MANUAL.strip().upper()
-        mes_id = buscar_carpeta_id(service, mes_nombre, anio_id)
-    else:
-        mes_nombre_sistema = MESES_ES[hoy.month]  # automático por mes actual
-        mes_id = buscar_carpeta_id(service, mes_nombre_sistema, anio_id)
+    return meses_procesar
 
-    if not mes_id:
-        print("🚫 No se encontró carpeta del mes.")
-        return
+# === PROCESAR ARCHIVOS DE UN MES ESPECÍFICO ===
+def procesar_mes(service, plaza_id, anio, mes_num, mes_nombre):
+    """
+    Procesa todos los archivos de un mes específico.
+    Retorna cantidad de archivos procesados exitosamente.
+    """
+    print(f"\n{'='*80}")
+    print(f"🗓️  PROCESANDO: {mes_nombre} {anio}")
+    print(f"{'='*80}\n")
 
-    # Prefijo MM_ desde el NOMBRE REAL de la carpeta del mes
-    nombre_mes_real = obtener_nombre_por_id(service, mes_id) or ""
-    clave_mes = nombre_mes_real.strip().upper()
-    if clave_mes not in MESES_INV:
-        print(f"⚠️ No pude mapear el mes desde el folder '{nombre_mes_real}'. Uso mes del sistema.")
-        mes_num = hoy.month
-    else:
-        mes_num = MESES_INV[clave_mes]
+    anio_str = str(anio)
     mes_dos = f"{mes_num:02d}"
-    print(f"🧩 Mes detectado por carpeta: '{nombre_mes_real}' → prefijo '{mes_dos}_'")
 
+    # Buscar carpeta del año
+    anio_id = buscar_carpeta_id(service, anio_str, plaza_id)
+    if not anio_id:
+        print(f"⚠️ No se encontró carpeta del año {anio_str}")
+        return 0
+
+    # Buscar carpeta del mes
+    mes_id = buscar_carpeta_id(service, mes_nombre, anio_id)
+    if not mes_id:
+        print(f"⚠️ No se encontró carpeta del mes {mes_nombre}")
+        return 0
+
+    # Buscar carpetas TH y RESPALDO
     th_id = buscar_carpeta_id(service, "TH", mes_id)
     respaldo_id = buscar_carpeta_id(service, "RESPALDO", mes_id)
 
     if not th_id or not respaldo_id:
         print("🚫 No se encontró carpeta TH o RESPALDO.")
-        return
+        return 0
 
+    # Listar archivos pendientes
     archivos = listar_archivos_boletaje(service, th_id)
     if not archivos:
-        print("❌ No hay archivos .xlsx/.xls/.csv/Sheets para procesar.")
-        return
+        print(f"✅ No hay archivos pendientes en {mes_nombre} {anio}")
+        return 0
 
-    for archivo in archivos:
+    print(f"📋 Se encontraron {len(archivos)} archivo(s) para procesar\n")
+    archivos_procesados = 0
+
+    # Procesar cada archivo
+    for idx, archivo in enumerate(archivos, 1):
         nombre_original = archivo['name']
         mime_type = archivo.get('mimeType', '')
-        print(f"🔄 Procesando archivo: {nombre_original} ({mime_type})")
+        print(f"[{idx}/{len(archivos)}] 🔄 Procesando: {nombre_original} ({mime_type})")
 
         # 1) Descargar / Exportar
         ruta_local, content_type = descargar_archivo(service, archivo['id'], nombre_original, mime_type)
@@ -233,6 +256,7 @@ def main():
         # 4) Si subió OK, mover a RESPALDO **sin renombrar en Drive**
         if ok:
             mover_a_respaldo(service, archivo['id'], th_id, respaldo_id)
+            archivos_procesados += 1
             try:
                 os.remove(ruta_local)
                 print("🗑️ Archivo local eliminado")
@@ -241,6 +265,96 @@ def main():
         else:
             print("⚠️ No se movió a RESPALDO porque la subida falló.")
         print("")
+
+    return archivos_procesados
+
+# === FLUJO PRINCIPAL ===
+def main():
+    hoy = datetime.datetime.now()
+    service = conectar_drive()
+
+    print(f"\n🚀 INICIANDO PROCESO DE CARGA MASIVA")
+    print(f"📅 Fecha actual: {hoy.strftime('%d/%m/%Y')}")
+
+    # Mostrar modo de ejecución
+    if MODO_MANUAL:
+        print(f"⚙️  MODO: MANUAL")
+        print(f"🎯 Procesando únicamente: {MES_MANUAL} {ANIO_MANUAL}\n")
+    else:
+        print(f"⚙️  MODO: AUTOMÁTICO")
+        print(f"🎯 Procesando últimos {MESES_ATRAS} meses + mes actual\n")
+
+    # Navegación por carpetas (ACTUALIZADO)
+    raiz_id = buscar_carpeta_id(service, "Archivos de carga Estacionamientos - ENTRA")
+    if not raiz_id:
+        print("🚫 No se encontró la carpeta raíz.")
+        return
+
+    plaza_id = buscar_carpeta_id(service, "61. 006-PLAZA REFORMA", raiz_id)  # ← actualizado
+    if not plaza_id:
+        print("🚫 No se encontró la carpeta de la plaza.")
+        return
+
+    # ============================
+    # MODO MANUAL: Procesar solo un mes específico
+    # ============================
+    if MODO_MANUAL:
+        mes_nombre = MES_MANUAL.strip().upper()
+
+        # Validar que el mes existe en el diccionario
+        if mes_nombre not in MESES_INV:
+            print(f"❌ ERROR: '{MES_MANUAL}' no es un mes válido.")
+            print(f"Meses válidos: {', '.join(MESES_ES.values())}")
+            return
+
+        mes_num = MESES_INV[mes_nombre]
+        archivos_procesados = procesar_mes(service, plaza_id, ANIO_MANUAL, mes_num, mes_nombre)
+
+        # Resumen
+        print(f"\n{'='*80}")
+        print(f"📊 RESUMEN FINAL - MODO MANUAL")
+        print(f"{'='*80}")
+        print(f"✅ Total de archivos procesados: {archivos_procesados}")
+        print(f"{'='*80}\n")
+        return
+
+    # ============================
+    # MODO AUTOMÁTICO: Procesar múltiples meses
+    # ============================
+
+    print(f"📊 Se procesarán los últimos {MESES_ATRAS} meses antes del mes actual\n")
+
+    # Obtener lista de meses a procesar
+    meses_a_procesar = obtener_meses_a_procesar(hoy, MESES_ATRAS)
+
+    # Estadísticas globales
+    total_archivos_procesados = 0
+    meses_procesados = 0
+
+    # Procesar cada mes (de más antiguo a más reciente)
+    for anio, mes_num, mes_nombre in reversed(meses_a_procesar):
+        archivos_procesados = procesar_mes(service, plaza_id, anio, mes_num, mes_nombre)
+        if archivos_procesados > 0:
+            meses_procesados += 1
+            total_archivos_procesados += archivos_procesados
+
+    # Procesar mes actual
+    print(f"\n{'='*80}")
+    print(f"🗓️  PROCESANDO MES ACTUAL: {MESES_ES[hoy.month]} {hoy.year}")
+    print(f"{'='*80}\n")
+
+    archivos_mes_actual = procesar_mes(service, plaza_id, hoy.year, hoy.month, MESES_ES[hoy.month])
+    if archivos_mes_actual > 0:
+        meses_procesados += 1
+        total_archivos_procesados += archivos_mes_actual
+
+    # Resumen final
+    print(f"\n{'='*80}")
+    print(f"📊 RESUMEN FINAL - MODO AUTOMÁTICO")
+    print(f"{'='*80}")
+    print(f"✅ Meses procesados: {meses_procesados}")
+    print(f"✅ Total de archivos procesados: {total_archivos_procesados}")
+    print(f"{'='*80}\n")
 
 if __name__ == '__main__':
     main()
