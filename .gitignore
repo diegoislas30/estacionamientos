@@ -1,0 +1,13 @@
+## ignora todos los .json donde se almacenan las credenciales de las API
+*.json
+
+## ignora todos los .env donde se almacenan las credenciales de las API
+*.env
+
+## ignora todos los .env donde se almacenan las credenciales de las API
+*.env
+
+## ignora todos los .env donde se almacenan las credenciales de las API
+*.env
+
+## ignora todos los .env donde se almacenan las credenciales de las API
